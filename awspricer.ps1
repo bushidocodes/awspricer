@@ -1,250 +1,199 @@
-$local = Get-Location;
-$working_directory = ".\awsworkingdirectory";
+<#
+.SYNOPSIS
+    Builds a spreadsheet of AWS GovCloud EC2 Reserved Instance market rates.
 
-#Create a Working Directory if it does not exist
-# New-Item -Force -Path $working_directory -ItemType directory
-# Pull the AWS Price Index
-# wget https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/index.json -OutFile awsworkingdirectory\index.json
-# Convert to PowerShell Object
-# $index = wget https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/index.json
-$awsPriceIndex = wget https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/index.json | ConvertFrom-Json
-# Access PowerShell Object
-# $awsPriceIndex | Get-Member -memberType NoteProperty
-#I want to get offers
-# $awsPriceIndex.offers
-#I want to get EC2
+.DESCRIPTION
+    awspricer queries the public AWS Price List Bulk API (NO AWS credentials
+    required) and extracts EC2 Reserved Instance pricing for the AWS GovCloud (US)
+    regions. By default it captures the 1-year, All Upfront, *standard* offering
+    class rate for each instance configuration and writes the results to a CSV.
 
-$awsEC2PriceVersionURL = "https://pricing.us-east-1.amazonaws.com" + $awsPriceIndex.offers.AmazonEC2.versionIndexUrl
-# $awsEC2PriceURL
-$awsEC2PriceVersion = wget $awsEC2PriceVersionURL | ConvertFrom-Json
+    Originally written in 2015/2016 for the FAA / CSGov hybrid-cloud contract,
+    this version is modernized for the current AWS Price List API:
+      * Uses the per-region offer files (~200 MB CSV) instead of the full
+        AmazonEC2 offer file (now ~8.6 GB) so it runs on a normal workstation.
+      * Handles BOTH GovCloud regions (us-gov-west-1 and us-gov-east-1). The
+        single "AWS GovCloud (US)" region the original script filtered on no
+        longer exists; locations are now "AWS GovCloud (US-West/US-East)".
+      * Tolerates AWS's mixed value formats ("1yr"/"1 yr",
+        "All Upfront"/"AllUpfront").
+      * Surfaces the OfferingClass (standard vs convertible) attribute that AWS
+        added after the original was written.
 
-# Access PowerShell Object
-# $awsEC2Price | Get-Member -memberType NoteProperty
-# $awsPriceIndex.offers.AmazonEC2.versionIndexUrl
-# $awsEC2PriceVersion.currentVersion
-# $awsEC2PriceVersion.versions.($awsEC2PriceVersion.currentVersion).offerVersionUrl
-# $awsEC2Price.versions.20160126001708 | Get-Member -memberType NoteProperty
-# $awsEC2Price.versions.20160126001708.offerVersionUrl
-$awsEC2PriceURL = "https://pricing.us-east-1.amazonaws.com" + $awsEC2PriceVersion.versions.($awsEC2PriceVersion.currentVersion).offerVersionUrl
-$awsEC2PriceURL
-$working_directory
-("EC2-"+$awsEC2PriceVersion.currentVersion)
-#wget ($awsEC2PriceURL) -OutFile $working_directory\($awsPriceIndex.offers.AmazonEC2.versionIndexUrl).json
-$cachePathJson = ".\awsworkingdirectory\EC2-" + ($awsEC2PriceVersion.currentVersion) + ".json"
-$cachePathXml = ".\awsworkingdirectory\EC2-" + ($awsEC2PriceVersion.currentVersion) + ".xml"
-#$cachePathJson
-if ((Test-Path $cachePathXml) -eq $False) {
-    if ((Test-Path $cachePathJson) -eq $False) {
-        Write-Host "Caching Current EC2 Pricing Information"
-        wget ($awsEC2PriceURL) -OutFile $cachePathJson
-    } else {
-        Write-Host "Converting EC2 Pricing Information to PowerShell Object"
-        Get-Content $cachePathJson | ConvertFrom-Json | Export-Clixml $cachePathXml
-    }
-} else {
-    Write-Host "Cache is current"
+.PARAMETER Regions
+    GovCloud region codes to include. Default: us-gov-west-1 and us-gov-east-1.
+
+.PARAMETER LeaseContractLength
+    Reserved term length to match (whitespace-insensitive). Default: "1yr".
+
+.PARAMETER PurchaseOption
+    Purchase option to match (whitespace-insensitive). Default: "All Upfront".
+
+.PARAMETER OfferingClass
+    standard, convertible, or all. Default: standard (the apples-to-apples
+    "market rate" comparison for contract cost verification).
+
+.PARAMETER OutputPath
+    CSV output file. Default: .\govcloud-ec2-pricing.csv
+
+.PARAMETER WorkingDirectory
+    Download cache directory. Default: .\awsworkingdirectory
+
+.PARAMETER OfferCode
+    AWS service offer code. Default: AmazonEC2. (Attribute extraction below is
+    EC2-specific; other services can be added by mapping their columns.)
+
+.EXAMPLE
+    .\awspricer.ps1
+    Writes 1yr All Upfront standard RI rates for both GovCloud regions.
+
+.EXAMPLE
+    .\awspricer.ps1 -Regions us-gov-west-1 -OfferingClass all -OutputPath west.csv
+#>
+[CmdletBinding()]
+param(
+    [string[]] $Regions             = @('us-gov-west-1', 'us-gov-east-1'),
+    [string]   $LeaseContractLength = '1yr',
+    [string]   $PurchaseOption      = 'All Upfront',
+    [ValidateSet('standard', 'convertible', 'all')]
+    [string]   $OfferingClass       = 'standard',
+    [string]   $OutputPath          = '.\govcloud-ec2-pricing.csv',
+    [string]   $WorkingDirectory    = '.\awsworkingdirectory',
+    [string]   $OfferCode           = 'AmazonEC2'
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'   # large Invoke-WebRequest downloads are much faster without the progress bar
+$PriceApiRoot          = 'https://pricing.us-east-1.amazonaws.com'
+
+# Whitespace-insensitive comparison helper. AWS now ships both "1yr"/"1 yr" and
+# "All Upfront"/"AllUpfront" in the same file, so we strip spaces before matching.
+function Normalize-Term([string] $s) { return ($s -replace '\s', '') }
+
+# -----------------------------------------------------------------------------
+# 1. Discover the per-region offer files via the (post-2016) region index.
+# -----------------------------------------------------------------------------
+Write-Host 'Fetching AWS price offer index...'
+$index = Invoke-RestMethod -Uri "$PriceApiRoot/offers/v1.0/aws/index.json" -UseBasicParsing
+$offer = $index.offers.$OfferCode
+if (-not $offer) { throw "Offer code '$OfferCode' not found in the AWS price index." }
+if (-not $offer.currentRegionIndexUrl) {
+    throw "No currentRegionIndexUrl for $OfferCode; the region-index API is unavailable."
 }
-$awsEC2Price = Import-Clixml $cachePathXml
 
-#$awsEC2Price.products.properties
+Write-Host "Fetching $OfferCode region index..."
+$regionIndex = Invoke-RestMethod -Uri ($PriceApiRoot + $offer.currentRegionIndexUrl) -UseBasicParsing
 
-#$awsEC2Price.products | Get-Member | foreach {$_} | select value
-#$awsEC2Price.products.properties | Get-Member | foreach {$_} | select value
+if (-not (Test-Path $WorkingDirectory)) {
+    New-Item -ItemType Directory -Path $WorkingDirectory | Out-Null
+}
 
-#This lists the names of the SKUs for EC2
-#$awsEC2Price.products | get-member -membertype properties | foreach {$_.Name}
+$wantLease    = Normalize-Term $LeaseContractLength
+$wantPurchase = Normalize-Term $PurchaseOption
+$allRows      = New-Object System.Collections.Generic.List[object]
 
-#This lists the number of the SKUs for EC2
-#$awsEC2Price.products | get-member -membertype properties | foreach {$_.Name} | Measure-Object
+foreach ($regionCode in $Regions) {
+    $regionEntry = $regionIndex.regions.$regionCode
+    if (-not $regionEntry) {
+        Write-Warning "Region '$regionCode' not found in the $OfferCode region index; skipping."
+        continue
+    }
 
-# This lists the definition of each SKU
-#$awsEC2Price.products | get-member -membertype properties | foreach {$_.Definition}
+    # The region offer is published as both index.json and index.csv. We use the
+    # CSV (each row is one product x term x price-dimension with named columns),
+    # which is far easier and lighter to process in PowerShell than nested JSON.
+    $csvUrlPath = $regionEntry.currentVersionUrl -replace 'index\.json$', 'index.csv'
+    $csvUrl     = $PriceApiRoot + $csvUrlPath
+    $version    = ($regionEntry.currentVersionUrl -split '/')[5]   # /offers/v1.0/aws/<offer>/<version>/<region>/index.json
+    $cacheCsv   = Join-Path $WorkingDirectory ('{0}-{1}-{2}.csv' -f $OfferCode, $regionCode, $version)
 
+    if (Test-Path $cacheCsv) {
+        Write-Host "Using cached price file: $cacheCsv"
+    }
+    else {
+        Write-Host "Downloading $OfferCode $regionCode pricing (version $version)..."
+        Invoke-WebRequest -Uri $csvUrl -OutFile $cacheCsv -UseBasicParsing
+    }
 
-#ForEach ($prop in ($awsEC2Price.products | get-member -membertype properties)) {$prop}
-
-#Define a nested array to store the service and pricing data for each sku
-$arrayOfGovCloudEc2Skus = @()
-
-ForEach ($prop in ($awsEC2Price.products | get-member -membertype properties)) {
-    if ($awsEC2Price.products.($prop.Name).attributes.location -eq "AWS GovCloud (US)") {
-        #$arrayOfGovCloudEc2Skus += @($prop.Name, $awsEC2Price.products.($prop.Name).attributes)
-        Write-host("Checking AWS Reserved Instance Price list for " + $prop.Name)
-        if ($awsEC2Price.terms.Reserved.($prop.Name)) {
-            Write-host("Found something for " + $prop.Name)
-            Write-host(($awsEC2Price.terms.Reserved.($prop.Name)) | get-member -membertype properties)
-            # $offerTermCodesForSku = ($awsEC2Price.terms.Reserved.($prop.Name)) | get-member -membertype properties
-            ForEach ($termprop in ($awsEC2Price.terms.Reserved.($prop.Name)) | get-member -membertype properties){
-                 Write-host("Doltermprop = " + $termprop)
-                 #Write-host("Doltermprop sel exp = " + $termprop | select -exp "offerTermCode")
-                 Write-host("Doltermprop Name = " + $termprop.Name )
-                 Write-host("Doltermprop offerTermCode = " + $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).offerTermCode )
-                #     Write-host("Doltermprop.offerTermCode = " + $termprop.offerTermCode)
-                #     Write-host("Doltermprop.attributes = " + $termprop.attributes)
-
-
-
-                if ($awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).termAttributes.LeaseContractLength -eq "1yr" -and $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).termAttributes.PurchaseOption -eq "All Upfront") {
-                    Write-host("Found the 1 year all upfront model for " + $prop.Name)
-                    $newObj = New-Object System.Object
-                    $newObj | Add-Member -type NoteProperty -name "SKU"                     -value $prop.Name
-                    $newObj | Add-Member -type NoteProperty -name Location                  -value $awsEC2Price.products.($prop.Name).attributes.location
-                    $newObj | Add-Member -type NoteProperty -name "Tenancy"                 -value $awsEC2Price.products.($prop.Name).attributes.tenancy
-                    $newObj | Add-Member -type NoteProperty -name "Instance Type"           -value $awsEC2Price.products.($prop.Name).attributes.instanceType
-                    $newObj | Add-Member -type NoteProperty -name "Instance Family"         -value $awsEC2Price.products.($prop.Name).attributes.instanceFamily
-                    $newObj | Add-Member -type NoteProperty -name "# virt cores"            -value $awsEC2Price.products.($prop.Name).attributes.vcpu
-                    $newObj | Add-Member -type NoteProperty -name "Host CPU"                -value $awsEC2Price.products.($prop.Name).attributes.physicalProcessor
-                    $newObj | Add-Member -type NoteProperty -name "Host CPU Clock Speed"    -value $awsEC2Price.products.($prop.Name).attributes.clockSpeed
-                    $newObj | Add-Member -type NoteProperty -name "Memory"                  -value $awsEC2Price.products.($prop.Name).attributes.memory
-                    $newObj | Add-Member -type NoteProperty -name "OS"                      -value $awsEC2Price.products.($prop.Name).attributes.operatingSystem
-                    $newObj | Add-Member -type NoteProperty -name "License"                 -value $awsEC2Price.products.($prop.Name).attributes.licenseModel
-                    $newObj | Add-Member -type NoteProperty -name "Bundled SW"              -value $awsEC2Price.products.($prop.Name).attributes.preInstalledSw
-                    ForEach ($priceDimension in $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).priceDimensions | get-member -membertype properties) {
-                        # Write-host("price def is " + $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).($priceDimension.Name).attributes.description)
-                        # Write-host("price def is " + $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).($priceDimension.Name).attributes)
-                        # Write-host("price def is " + $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).($priceDimension.Name).
-                        # $priceDimension.Name
-                        # Write-host("price def is " + $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).priceDimensions.($priceDimension.Name).unit)
-                        # Write-host("price def is " + $priceDimension.description)
-                        # Write-host("price def is " + $priceDimension)
-                        if ($awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).priceDimensions.($priceDimension.Name).unit -eq "Quantity") {
-                            $perYear = $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).priceDimensions.($priceDimension.Name).pricePerUnit.USD
-                            $perMonth = $perYear / 12;
-                            $newObj | Add-Member -type NoteProperty -name "Per Month Cost"                  -value $perMonth
-                            # $priceDimension.attributes.pricePerUnit
-                            # Write-host("Host of VM is " + $priceDimension.attributes.pricePerUnit.USD)
-                        } else {
-                            Write-host("derp")
-                        }
-                    }
-                    # $newObj | Add-Member -type NoteProperty -name "Price 1yr upfront"       -value ($awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).priceDimensions | Select-Object -Index 0 )
-                    # $newObj | Add-Member -type NoteProperty -name "Experiment"              - Value $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).priceDimensions[0]
-                    $arrayOfGovCloudEc2Skus += $newObj
-                #     $arrayOfGovCloudEc2Skus += @(
-                #         "SKU":$prop.Name;
-                #         "Location":$awsEC2Price.products.($prop.Name).location;
-                #         "Instance Type":$awsEC2Price.products.($prop.Name).instanceType;
-                #         "Instance Family":$awsEC2Price.products.($prop.Name).instanceFamily;
-                #         "# virt cores":$awsEC2Price.products.($prop.Name).vcpu;
-                #         "Host CPU":$awsEC2Price.products.($prop.Name).physicalProcessor;
-                #         "Host CPU Clock Speed":$awsEC2Price.products.($prop.Name).clockSpeed;
-                #         "Memory":$awsEC2Price.products.($prop.Name).memory;
-                #         "Price 1yr upfront":$awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).priceDimensions;
-                #         "Experiment":$awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name).priceDimensions[0]
-                # }
-                    # $awsEC2Price.products.($prop.Name).location,
-
-
-
-                    # , $awsEC2Price.terms.Reserved.($prop.Name).($termprop.Name))
-                }
-            }
-        } else {
-            Write-host("No AWS Reserved Instancee Offer Terms for " + $prop.Name)
+    # -------------------------------------------------------------------------
+    # 2. Stream the CSV: skip the 5-line metadata preamble, keep the header, and
+    #    coarse-filter to Reserved rows so we only materialize a small subset.
+    # -------------------------------------------------------------------------
+    Write-Host "Parsing $regionCode price file..."
+    $reader = [System.IO.StreamReader]::new($cacheCsv)
+    try {
+        $header = $null
+        $kept   = New-Object System.Collections.Generic.List[string]
+        $lineNo = 0
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $lineNo++
+            if ($lineNo -le 5) { continue }                    # metadata preamble
+            if ($lineNo -eq 6) { $header = $line; continue }   # column header row
+            if ($line -like '*Reserved*') { $kept.Add($line) } # cheap coarse pre-filter
         }
+    }
+    finally {
+        $reader.Dispose()
+    }
 
-        $arrayOfGovCloudEc2Skus | export-csv -path data1.csv
+    if (-not $header)      { Write-Warning "No header row in $cacheCsv; skipping."; continue }
+    if ($kept.Count -eq 0) { Write-Warning "No Reserved rows found for $regionCode."; continue }
 
+    $rows = @($header) + $kept | ConvertFrom-Csv
 
+    # -------------------------------------------------------------------------
+    # 3. Precise filter. For "All Upfront" RIs the entire 1-year cost is the
+    #    single price dimension with Unit = "Quantity" (the recurring Hrs rate is
+    #    $0.00), so that row is the upfront fee we want.
+    # -------------------------------------------------------------------------
+    $matches = $rows | Where-Object {
+        $_.TermType -eq 'Reserved' -and
+        $_.Unit     -eq 'Quantity' -and
+        (Normalize-Term $_.LeaseContractLength) -eq $wantLease -and
+        (Normalize-Term $_.PurchaseOption)      -eq $wantPurchase -and
+        ($OfferingClass -eq 'all' -or $_.OfferingClass -eq $OfferingClass)
+    }
 
+    Write-Host ('  {0} matching Reserved offers in {1}' -f @($matches).Count, $regionCode)
 
-        #Write-host(($awsEC2Price.terms.Reserved.($prop.Name)) | get-member)
-        #$offerTermCodesForSku = ($awsEC2Price.terms.Reserved.($prop.Name)) | get-member -membertype properties
-        #ForEach ($termprop in $offerTermCodesForSku){
-        #   if ($termprop.termAttributes.LeaseContractLength -eq "1yr" -and $termprop.termAttributes.PurchaseOption -eq "All Upfront") {
-        #       $arrayOfGovCloudEc2Skus += @($prop.Name, $awsEC2Price.products.($prop.Name).attributes,$termprop)
-        #   }
-        #}
+    foreach ($r in $matches) {
+        $perYear = 0.0
+        [void][double]::TryParse($r.PricePerUnit, [ref] $perYear)
+        $allRows.Add([pscustomobject][ordered]@{
+            'SKU'                  = $r.SKU
+            'Region Code'          = $r.'Region Code'
+            'Location'             = $r.Location
+            'Product Family'       = $r.'Product Family'   # "Compute Instance" vs "Dedicated Host" (priced per host)
+            'Tenancy'              = $r.Tenancy
+            'Instance Type'        = $r.'Instance Type'
+            'Instance Family'      = $r.'Instance Family'
+            '# virt cores'         = $r.vCPU
+            'Host CPU'             = $r.'Physical Processor'
+            'Host CPU Clock Speed' = $r.'Clock Speed'
+            'Memory'               = $r.Memory
+            'OS'                   = $r.'Operating System'
+            'License'              = $r.'License Model'
+            'Bundled SW'           = $r.'Pre Installed S/W'
+            'Offering Class'       = $r.OfferingClass
+            'Lease'                = $r.LeaseContractLength
+            'Purchase Option'      = $r.PurchaseOption
+            'Upfront Cost (1yr)'   = $perYear
+            'Per Month Cost'       = [math]::Round($perYear / 12, 2)
+        })
     }
 }
-#$awsEC2Price.terms.Reserved.($prop.Name)
 
-$arrayOfGovCloudEc2Skus
-$arrayOfGovCloudEc2Skus | Measure-Object
+# -----------------------------------------------------------------------------
+# 4. Output.
+# -----------------------------------------------------------------------------
+if ($allRows.Count -eq 0) {
+    Write-Warning 'No matching GovCloud Reserved Instance prices found. Nothing written.'
+    return
+}
 
-#Sanity Check to make sure that we're accessing the AWS API properly
-$awsEC2Price.products.QWQYA39QABGHWZT5.sku
-$awsEC2Price.products.QWQYA39QABGHWZT5.productFamily
-$awsEC2Price.products.QWQYA39QABGHWZT5.attributes
-$awsEC2Price.products.QWQYA39QABGHWZT5.attributes.location
-#$awsEC2Price.terms.Reserved
-$awsEC2Price.terms.Reserved.DQ578CGN99KG6ECF
-$awsEC2Price.terms.Reserved.DQ578CGN99KG6ECF."DQ578CGN99KG6ECF.HU7G6KETJZ"
-$awsEC2Price.terms.Reserved.DQ578CGN99KG6ECF."DQ578CGN99KG6ECF.HU7G6KETJZ".offerTermCode
-$awsEC2Price.terms.Reserved."DQ578CGN99KG6ECF"."DQ578CGN99KG6ECF.6QCMYABX3D".priceDimensions."DQ578CGN99KG6ECF.6QCMYABX3D.6YS6EN2CT7".unit
-$awsEC2Price.terms.Reserved."DQ578CGN99KG6ECF"."DQ578CGN99KG6ECF.6QCMYABX3D".priceDimensions."DQ578CGN99KG6ECF.6QCMYABX3D.6YS6EN2CT7".pricePerUnit.USD
-#$awsEC2Price.terms.Reserved.QWQYA39QABGHWZT5."QWQYA39QABGHWZT5.JRTCKXETXF"
-#$awsEC2Price.terms.Reserved.QWQYA39QABGHWZT5."QWQYA39QABGHWZT5.JRTCKXETXF".attributes.offerTermCode
+$allRows |
+    Sort-Object 'Region Code', 'Instance Family', 'Instance Type', 'OS' |
+    Export-Csv -Path $OutputPath -NoTypeInformation
 
-#$awsEC2Price.terms.Reserved
-
-
-#    "termAttributes" : {
-#            "LeaseContractLength" : "1yr",
-#            "PurchaseOption" : "All Upfront"
-#          }
-
-# $awsEC2Price.products | get-member | foreach {$_Definition}
-#foreach($prop in $awsEC2Price.products.properties)
-
-# | ? {$_.sku.StartsWith("Q")} | select value)
-
-#$awsEC2Price.GetType()
-#$awsEC2Price.products.GetType()
-#$awsEC2Price.products | foreach { $_ } | Measure-Object
-#$awsEC2Price.products | foreach { $_.psobject }
-#$awsEC2Price.products | Get-Member
-#$awsEC2Price.products | Where-Object {$_.sku -eq "QWQYA39QABGHWZT5"}
-#$awsEC2Price.products.QWQYA39QABGHWZT5
-#$awsEC2Price.products.QWQYA39QABGHWZT5.terms
-#$awsEC2Price.products.QWQYA39QABGHWZT5 | Get-Member
-
-###Iterate through the EC2 SKUs and add the SKU as a string to an array of strings when the SKU has a location attribute of "AWS GovCloud (US)"
-###Iterate through terms onDemand,
-###
-
-
-
-#$i = 1
-#Foreach ($ec2Service in $awsEC2Price.products.attributes) {
-#    Write-Host $i
-#    $i++
-#    $ec2Service.GetItem("sku")
-#     if ($ec2Service.attributes.location -eq "AWS GovCloud (US)") {
-#         Write-Host "Is in GovCloud"
-#     } else {
-#         Write-Host "Is not in GovCloud"
-#     }
-
-#}
-
-#start $awsEC2PriceURL
-
-# Iterate through JSON and select attributes.location = "AWS GovCloud (US)"
-#"location" : "AWS GovCloud (US)",
-    # "QWQYA39QABGHWZT5" : {
-    #   "sku" : "QWQYA39QABGHWZT5",
-    #   "productFamily" : "Compute Instance",
-    #   "attributes" : {
-    #     "servicecode" : "AmazonEC2",
-    #     "location" : "AWS GovCloud (US)",
-    #     "locationType" : "AWS Region",
-    #     "instanceType" : "i2.4xlarge",
-    #     "currentGeneration" : "Yes",
-    #     "instanceFamily" : "Storage optimized",
-    #     "vcpu" : "16",
-    #     "physicalProcessor" : "Intel Xeon E5-2670 v2 (Ivy Bridge)",
-    #     "clockSpeed" : "2.5 GHz",
-    #     "memory" : "122 GiB",
-    #     "storage" : "4 x 800 SSD",
-    #     "networkPerformance" : "High",
-    #     "processorArchitecture" : "64-bit",
-    #     "tenancy" : "Shared",
-    #     "operatingSystem" : "Windows",
-    #     "licenseModel" : "Bring your own license",
-    #     "usagetype" : "UGW1-BoxUsage:i2.4xlarge",
-    #     "operation" : "RunInstances:0800",
-    #     "enhancedNetworkingSupported" : "Yes",
-    #     "preInstalledSw" : "NA",
-    #     "processorFeatures" : "Intel AVX; Intel Turbo"
-    #   }
+Write-Host ('Wrote {0} rows to {1}' -f $allRows.Count, $OutputPath)
+$allRows | Select-Object -First 10 | Format-Table -AutoSize
