@@ -1,0 +1,7 @@
+# AWS price-list download cache (large; regenerated on demand)
+awsworkingdirectory/
+
+# Generated pricing spreadsheets
+govcloud-ec2-pricing.csv
+data1.csv
+*.pricing.csv
