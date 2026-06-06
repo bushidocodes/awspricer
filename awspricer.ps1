@@ -158,7 +158,12 @@ foreach ($regionCode in $Regions) {
 
     foreach ($r in $matches) {
         $perYear = 0.0
-        [void][double]::TryParse($r.PricePerUnit, [ref] $perYear)
+        [void][double]::TryParse(
+            $r.PricePerUnit,
+            [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref] $perYear
+        )
         $allRows.Add([pscustomobject][ordered]@{
             'SKU'                  = $r.SKU
             'Region Code'          = $r.'Region Code'
