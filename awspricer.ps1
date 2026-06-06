@@ -201,4 +201,4 @@ $allRows |
     Export-Csv -Path $OutputPath -NoTypeInformation
 
 Write-Host ('Wrote {0} rows to {1}' -f $allRows.Count, $OutputPath)
-$allRows | Select-Object -First 10 | Format-Table -AutoSize
+$allRows | Select-Object -First 10 | Format-Table -AutoSize | Out-Host
