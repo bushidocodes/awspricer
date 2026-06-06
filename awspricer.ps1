@@ -146,7 +146,7 @@ foreach ($regionCode in $Regions) {
     #    single price dimension with Unit = "Quantity" (the recurring Hrs rate is
     #    $0.00), so that row is the upfront fee we want.
     # -------------------------------------------------------------------------
-    $matches = $rows | Where-Object {
+    $reservedOffers = $rows | Where-Object {
         $_.TermType -eq 'Reserved' -and
         $_.Unit     -eq 'Quantity' -and
         (Normalize-Term $_.LeaseContractLength) -eq $wantLease -and
@@ -154,9 +154,9 @@ foreach ($regionCode in $Regions) {
         ($OfferingClass -eq 'all' -or $_.OfferingClass -eq $OfferingClass)
     }
 
-    Write-Host ('  {0} matching Reserved offers in {1}' -f @($matches).Count, $regionCode)
+    Write-Host ('  {0} matching Reserved offers in {1}' -f @($reservedOffers).Count, $regionCode)
 
-    foreach ($r in $matches) {
+    foreach ($r in $reservedOffers) {
         $perYear = 0.0
         [void][double]::TryParse(
             $r.PricePerUnit,
