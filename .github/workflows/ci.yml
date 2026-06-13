@@ -28,9 +28,11 @@ jobs:
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           foreach ($m in @(
               @{ Name = 'Pester'; MinimumVersion = '5.0' },
-              @{ Name = 'PSScriptAnalyzer' }
+              @{ Name = 'PSScriptAnalyzer'; MinimumVersion = '1.0' }
           )) {
-              if (-not (Get-Module -ListAvailable @m)) {
+              $have = Get-Module -ListAvailable -Name $m.Name |
+                  Where-Object { $_.Version -ge [version]$m.MinimumVersion }
+              if (-not $have) {
                   Install-Module @m -Force -Scope CurrentUser -SkipPublisherCheck
               }
           }
